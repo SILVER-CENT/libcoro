@@ -32,6 +32,89 @@ project(libcoro
 
 message(STATUS "${PROJECT_NAME} version: ${PROJECT_VERSION}")
 
+# ============================================================================
+# Optimization Flags Configuration
+# ============================================================================
+
+# Enable modern CMake policies for better LTO support
+if(POLICY CMP0069)
+    cmake_policy(SET CMP0069 NEW) # Enable INTERPROCEDURAL_OPTIMIZATION
+    set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
+endif()
+
+# Check for IPO/LTO support
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+
+if(ipo_supported)
+    message(STATUS "IPO/LTO is supported and will be enabled for Release builds")
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO OFF)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_DEBUG OFF)
+    
+    # Prefer ThinLTO for faster builds with most benefits
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        set(CMAKE_CXX_COMPILE_OPTIONS_IPO "-flto=thin")
+        set(CMAKE_C_COMPILE_OPTIONS_IPO "-flto=thin")
+        message(STATUS "Using ThinLTO for Clang")
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+        # GCC: use -flto with auto for parallel LTO
+        set(CMAKE_CXX_COMPILE_OPTIONS_IPO "-flto=auto")
+        set(CMAKE_C_COMPILE_OPTIONS_IPO "-flto=auto")
+        message(STATUS "Using LTO with auto parallelization for GCC")
+    endif()
+else()
+    message(STATUS "IPO/LTO is not supported: ${ipo_error}")
+endif()
+
+# Compiler-specific optimization flags
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # Release: Aggressive optimizations with security hardening
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fvisibility=hidden -fvisibility-inlines-hidden")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -fdata-sections -ffunction-sections")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -D_FORTIFY_SOURCE=2 -fstack-protector-strong")
+    
+    # RelWithDebInfo: Moderate optimizations with profiling support
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -fno-omit-frame-pointer")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -fvisibility=hidden -fvisibility-inlines-hidden")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -D_FORTIFY_SOURCE=2")
+    
+    # Debug: Maximize debuggability
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -fno-omit-frame-pointer")
+    
+    # Linker flags for dead code elimination and security
+    if(UNIX AND NOT APPLE)
+        # Linux: Use --gc-sections for dead code elimination and RELRO for security
+        add_link_options("$<$<CONFIG:Release>:-Wl,--gc-sections,-z,relro,-z,now>")
+        add_link_options("$<$<CONFIG:RelWithDebInfo>:-Wl,--gc-sections>")
+    elseif(APPLE)
+        # macOS: Use -dead_strip for dead code elimination
+        add_link_options("$<$<CONFIG:Release>:-Wl,-dead_strip>")
+        add_link_options("$<$<CONFIG:RelWithDebInfo>:-Wl,-dead_strip>")
+    endif()
+
+elseif(MSVC)
+    # MSVC Release optimizations
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /GL /Gw /Gy /Oi /Ot /Zc:inline")
+    # Security: Control Flow Guard and Spectre mitigation
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /guard:cf /Qspectre")
+    
+    # MSVC linker flags for Release (whole program optimization)
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG /OPT:REF,ICF")
+    set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /LTCG /OPT:REF,ICF")
+    set(CMAKE_STATIC_LINKER_FLAGS_RELEASE "${CMAKE_STATIC_LINKER_FLAGS_RELEASE} /LTCG")
+    
+    # RelWithDebInfo: Keep frame pointers for profiling
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} /Oy-")
+    
+    # Debug: Runtime checks
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /RTC1")
+endif()
+
+# ============================================================================
+# End Optimization Flags Configuration
+# ============================================================================
+
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     set(MACOSX TRUE)
     # We need to build with clang >= 17, assuming its installed by
@@ -205,7 +288,16 @@ if(DEFINED EMSCRIPTEN)
 endif()
 
 add_library(${PROJECT_NAME} ${LIBCORO_SOURCE_FILES})
-set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX PREFIX "" VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
+set_target_properties(${PROJECT_NAME} PROPERTIES 
+    LINKER_LANGUAGE CXX 
+    PREFIX "" 
+    VERSION ${PROJECT_VERSION} 
+    SOVERSION ${PROJECT_VERSION_MAJOR}
+    # Symbol visibility control for better optimization and smaller binaries
+    CXX_VISIBILITY_PRESET hidden
+    C_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
 
 if(LIBCORO_ENABLE_ASAN)
     add_compile_options(-g -O0 -fno-omit-frame-pointer -fsanitize=address)

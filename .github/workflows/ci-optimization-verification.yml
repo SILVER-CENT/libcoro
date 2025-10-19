@@ -1,0 +1,144 @@
+name: Optimization Verification
+
+on: [pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-optimizations:
+    name: Verify Optimization Flags
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: ubuntu:24.04
+      env:
+        TZ: America/New_York
+        DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install Dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            cmake \
+            git \
+            ninja-build \
+            g++-13 \
+            libssl-dev \
+            binutils \
+            jq
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Mark repository as safe
+        run: git config --global --add safe.directory "*"
+
+      - name: Build Release
+        run: |
+          mkdir Release
+          cd Release
+          cmake \
+            -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_C_COMPILER=gcc-13 \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DLIBCORO_BUILD_TESTS=ON \
+            ..
+          ninja
+
+      - name: Run Optimization Verification Script
+        run: |
+          chmod +x verify_optimizations.sh
+          ./verify_optimizations.sh Release
+
+      - name: Verify LTO is Enabled
+        run: |
+          cd Release
+          # Check if LTO sections exist
+          if readelf -S libcoro.a 2>/dev/null | grep -q "\.gnu\.lto"; then
+            echo "✅ LTO sections detected"
+          else
+            echo "⚠️  LTO sections not found (may be normal for static libs)"
+          fi
+
+      - name: Verify Optimization Flags in Compile Commands
+        run: |
+          cd Release
+          # Check for key optimization flags
+          COMPILE_CMD=$(jq -r '.[] | select(.file | contains("src/event.cpp")) | .command' compile_commands.json)
+          
+          echo "Checking optimization flags..."
+          FLAGS=(
+            "-flto"
+            "-fvisibility=hidden"
+            "-fdata-sections"
+            "-ffunction-sections"
+            "-D_FORTIFY_SOURCE=2"
+            "-fstack-protector-strong"
+          )
+          
+          for FLAG in "${FLAGS[@]}"; do
+            if echo "$COMPILE_CMD" | grep -q -- "$FLAG"; then
+              echo "✅ $FLAG"
+            else
+              echo "❌ $FLAG MISSING"
+              exit 1
+            fi
+          done
+
+      - name: Check Binary Size
+        run: |
+          cd Release
+          echo "Library size:"
+          ls -lh libcoro.a
+          size libcoro.a || true
+
+      - name: Run Tests
+        run: |
+          cd Release
+          ctest -VV
+
+  build-type-matrix:
+    name: Build Type - ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        build_type: [Release, RelWithDebInfo, Debug]
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Install Dependencies
+        run: |
+          apt-get update
+          apt-get install -y cmake git ninja-build g++-13 libssl-dev
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build ${{ matrix.build_type }}
+        run: |
+          mkdir build
+          cd build
+          cmake \
+            -GNinja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_C_COMPILER=gcc-13 \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            ..
+          ninja
+
+      - name: Test ${{ matrix.build_type }}
+        run: |
+          cd build
+          ctest -VV
